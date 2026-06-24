@@ -20,7 +20,6 @@ def safe_float(val, default=0.0):
 
 
 def format_rate(val):
-    """Formats decimal rates (e.g., 0.221 -> .221) for baseball standards."""
     try:
         s = f"{float(val):.3f}"
         return s[1:] if s.startswith("0.") else s
@@ -104,16 +103,14 @@ def get_pitcher_baseline_data(pitcher_ids):
     return stats_dict
 
 
-# --- 3. DEEP DIVE DATA FETCHING (DOINK EXACT REPLICATION) ---
+# --- 3. DEEP DIVE DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def process_pitcher_dashboard_data(first_name, last_name, year, pitcher_id):
-    """Calculates all advanced metrics directly from raw API and Statcast feeds matching Doink logic."""
     if not pitcher_id:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     top_table = []
 
-    # 1. Fetch Season Stats (Top Table) via StatsAPI for official line
     try:
         url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}?hydrate=stats(group=[pitching],type=[season],season={year})"
         season_data = fetch_json(url)
@@ -140,17 +137,18 @@ def process_pitcher_dashboard_data(first_name, last_name, year, pitcher_id):
                     'HR/9': api_stats.get('homeRunsPer9', '0.00'),
                     'BRL%': '0.0%'
                 })
-    except Exception:
+    except Exception as e:
         pass
 
-    # 2. Process Raw Statcast Data Stream for Hit Type Breakdowns
     sc_data = pd.DataFrame()
     splits_list = []
+    tto_list = []
+    order_list = []
+
     try:
         sc_data = statcast_pitcher(f'{year}-03-01', f'{year}-11-01', pitcher_id)
         if not sc_data.empty:
 
-            # Calculate overall BRL% out of total BBE (type == 'X')
             overall_bbe = sc_data[sc_data['type'] == 'X']
             if len(overall_bbe) > 0:
                 overall_brl = len(overall_bbe[overall_bbe['launch_speed_angle'] == 6])
@@ -158,25 +156,31 @@ def process_pitcher_dashboard_data(first_name, last_name, year, pitcher_id):
                 if top_table:
                     top_table[0]['BRL%'] = f"{round(overall_brl_pct, 1)}%"
 
-            split_definitions = [
-                ('vs RHB', 'R'),
-                ('vs LHB', 'L')
+            sc_data = sc_data.sort_values(by=['game_date', 'game_pk', 'at_bat_number', 'pitch_number'])
+            pas = sc_data[['game_pk', 'at_bat_number']].drop_duplicates()
+            pas['pa_rank'] = pas.groupby('game_pk').cumcount() + 1
+
+            pas['TTTO'] = pas['pa_rank'].apply(
+                lambda x: '1st TTO' if x <= 9 else ('2nd TTO' if x <= 18 else '3rd+ TTO'))
+            pas['Order_Slot'] = ((pas['pa_rank'] - 1) % 9) + 1
+
+            sc_data = sc_data.merge(pas[['game_pk', 'at_bat_number', 'TTTO', 'Order_Slot']],
+                                    on=['game_pk', 'at_bat_number'], how='left')
+
+            platoon_defs = [
+                ('vs RHB', sc_data['stand'] == 'R'),
+                ('vs LHB', sc_data['stand'] == 'L')
             ]
 
-            for name, stand in split_definitions:
-                # Grab pitch streams from main sc_data block
-                subset_pitches = sc_data[sc_data['stand'] == stand]
+            for name, condition in platoon_defs:
+                subset_pitches = sc_data[condition]
                 if subset_pitches.empty: continue
 
-                # FIX 1: BF evaluated as unique structural combination of game_pk and at_bat_number
                 pa_df = subset_pitches.drop_duplicates(subset=['game_pk', 'at_bat_number'])
                 bf = len(pa_df)
-
-                # Isolate terminal event rows safely
                 terminal_events = pa_df.dropna(subset=['events'])
                 ev_counts = terminal_events['events'].value_counts()
 
-                # Raw Outcomes
                 hr = ev_counts.get('home_run', 0)
                 single = ev_counts.get('single', 0)
                 double = ev_counts.get('double', 0)
@@ -187,17 +191,14 @@ def process_pitcher_dashboard_data(first_name, last_name, year, pitcher_id):
                 sf = ev_counts.get('sac_fly', 0) + ev_counts.get('sac_fly_double_play', 0)
                 sac = ev_counts.get('sac_bunt', 0) + ev_counts.get('sac_bunt_double_play', 0)
 
-                # Derived Structural Denominators
                 hits = single + double + triple + hr
                 ab = bf - bb - hbp - sf - sac
 
-                # FIX 2: Sabermetric Splits Calculations Re-Engineered
-                oba = hits / ab if ab > 0 else 0  # OBA = Hits / At Bats
-                slg = (single + 2 * double + 3 * triple + 4 * hr) / ab if ab > 0 else 0  # SLG = Total Bases / At Bats
-                iso = slg - oba  # ISO = SLG - OBA
+                oba = hits / ab if ab > 0 else 0
+                slg = (single + 2 * double + 3 * triple + 4 * hr) / ab if ab > 0 else 0
+                iso = slg - oba
                 k_pct = (k / bf * 100) if bf > 0 else 0
 
-                # FIX 3: Quality of contact compiled strictly out of BBE (type == 'X') from core slice
                 bbe = subset_pitches[subset_pitches['type'] == 'X']
                 barrels = bbe[bbe['launch_speed_angle'] == 6]
                 hard_hit = bbe[bbe['launch_speed'] >= 95]
@@ -221,12 +222,111 @@ def process_pitcher_dashboard_data(first_name, last_name, year, pitcher_id):
                     'K%': f"{round(k_pct, 1)}%"
                 })
 
+            tto_defs = [
+                ('1st TTO (1-9)', sc_data['TTTO'] == '1st TTO'),
+                ('2nd TTO (10-18)', sc_data['TTTO'] == '2nd TTO'),
+                ('3rd+ TTO (19+)', sc_data['TTTO'] == '3rd+ TTO')
+            ]
+
+            for name, condition in tto_defs:
+                subset_pitches = sc_data[condition]
+                if subset_pitches.empty: continue
+
+                pa_df = subset_pitches.drop_duplicates(subset=['game_pk', 'at_bat_number'])
+                bf = len(pa_df)
+                terminal_events = pa_df.dropna(subset=['events'])
+                ev_counts = terminal_events['events'].value_counts()
+
+                hr = ev_counts.get('home_run', 0)
+                single = ev_counts.get('single', 0)
+                double = ev_counts.get('double', 0)
+                triple = ev_counts.get('triple', 0)
+                bb = ev_counts.get('walk', 0) + ev_counts.get('intent_walk', 0)
+                k = ev_counts.get('strikeout', 0) + ev_counts.get('strikeout_double_play', 0)
+                hbp = ev_counts.get('hit_by_pitch', 0)
+                sf = ev_counts.get('sac_fly', 0) + ev_counts.get('sac_fly_double_play', 0)
+                sac = ev_counts.get('sac_bunt', 0) + ev_counts.get('sac_bunt_double_play', 0)
+
+                hits = single + double + triple + hr
+                ab = bf - bb - hbp - sf - sac
+
+                avg = hits / ab if ab > 0 else 0
+                obp_denom = ab + bb + hbp + sf
+                obp = (hits + bb + hbp) / obp_denom if obp_denom > 0 else 0
+                slg = (single + 2 * double + 3 * triple + 4 * hr) / ab if ab > 0 else 0
+                ops = obp + slg
+
+                tto_list.append({
+                    'TTO SPLIT': name,
+                    'AB': ab,
+                    'H': hits,
+                    '2B': double,
+                    '3B': triple,
+                    'HR': hr,
+                    'BB': bb,
+                    'HBP': hbp,
+                    'SO': k,
+                    'AVG': format_rate(avg),
+                    'OBP': format_rate(obp),
+                    'SLG': format_rate(slg),
+                    'OPS': format_rate(ops)
+                })
+
+            order_defs = [(f"Slot {i}", sc_data['Order_Slot'] == i) for i in range(1, 10)]
+
+            for name, condition in order_defs:
+                subset_pitches = sc_data[condition]
+                if subset_pitches.empty: continue
+
+                pa_df = subset_pitches.drop_duplicates(subset=['game_pk', 'at_bat_number'])
+                bf = len(pa_df)
+                terminal_events = pa_df.dropna(subset=['events'])
+                ev_counts = terminal_events['events'].value_counts()
+
+                hr = ev_counts.get('home_run', 0)
+                single = ev_counts.get('single', 0)
+                double = ev_counts.get('double', 0)
+                triple = ev_counts.get('triple', 0)
+                bb = ev_counts.get('walk', 0) + ev_counts.get('intent_walk', 0)
+                k = ev_counts.get('strikeout', 0) + ev_counts.get('strikeout_double_play', 0)
+                hbp = ev_counts.get('hit_by_pitch', 0)
+                sf = ev_counts.get('sac_fly', 0) + ev_counts.get('sac_fly_double_play', 0)
+                sac = ev_counts.get('sac_bunt', 0) + ev_counts.get('sac_bunt_double_play', 0)
+
+                hits = single + double + triple + hr
+                ab = bf - bb - hbp - sf - sac
+
+                avg = hits / ab if ab > 0 else 0
+                obp_denom = ab + bb + hbp + sf
+                obp = (hits + bb + hbp) / obp_denom if obp_denom > 0 else 0
+                slg = (single + 2 * double + 3 * triple + 4 * hr) / ab if ab > 0 else 0
+                ops = obp + slg
+
+                order_list.append({
+                    'BATTING ORDER': name,
+                    'AB': ab,
+                    'H': hits,
+                    '2B': double,
+                    '3B': triple,
+                    'HR': hr,
+                    'BB': bb,
+                    'HBP': hbp,
+                    'SO': k,
+                    'AVG': format_rate(avg),
+                    'OBP': format_rate(obp),
+                    'SLG': format_rate(slg),
+                    'OPS': format_rate(ops)
+                })
+
     except Exception as e:
         st.error(f"Statcast calculation error: {e}")
 
     top_df = pd.DataFrame(top_table)
-    bottom_df = pd.DataFrame(splits_list)
-    return top_df, bottom_df, sc_data
+    platoon_df = pd.DataFrame(splits_list)
+    tto_df = pd.DataFrame(tto_list)
+    order_df = pd.DataFrame(order_list)
+
+    return top_df, platoon_df, tto_df, order_df, sc_data
 
 
 # --- 4. MAIN DASHBOARD EXECUTION ---
@@ -255,15 +355,15 @@ if not probables.empty:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("🔥 Strikeout Targets");
+        st.subheader("🔥 Strikeout Targets")
         st.dataframe(
             df.nlargest(5, "SO Score")[['Pitcher', 'Opponent', 'Proj SO', 'SO Score']], hide_index=True)
     with c2:
-        st.subheader("🛡️ Outs Recorded");
+        st.subheader("🛡️ Outs Recorded")
         st.dataframe(
             df.nlargest(5, "Outs Score")[['Pitcher', 'Opponent', 'Proj Outs', 'Outs Score']], hide_index=True)
     with c3:
-        st.subheader("🚨 Fade Targets (Regress)");
+        st.subheader("🚨 Fade Targets (Regress)")
         st.dataframe(
             df.nlargest(5, "Fade Score")[['Pitcher', 'Opponent', 'Reg_Idx', 'Fade Score']], hide_index=True)
 
@@ -295,9 +395,11 @@ if not probables.empty:
         last = name_parts[1] if len(name_parts) > 1 else ""
 
         with st.spinner(f"Extracting Statcast Data for {selected_p}..."):
-            season_df, platoon_df, raw_sc = process_pitcher_dashboard_data(first, last, datetime.now().year, p_id)
+            season_df, platoon_df, tto_df, order_df, raw_sc = process_pitcher_dashboard_data(first, last,
+                                                                                             datetime.now().year, p_id)
 
-            col1, col2 = st.columns([1.2, 0.8])
+            # --- UPDATED LAYOUT COLUMNS: 70% Tables, 30% Graphics ---
+            col1, col2 = st.columns([7, 3])
 
             with col1:
                 st.markdown("#### Baseline Cumulative Season Layout")
@@ -312,6 +414,18 @@ if not probables.empty:
                 else:
                     st.info("No split profiles compiled yet for this matchup window.")
 
+                st.markdown("#### Times Through Order (Slash Line Matrix)")
+                if tto_df is not None and not tto_df.empty:
+                    st.dataframe(tto_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No TTO profiles compiled yet for this matchup window.")
+
+                st.markdown("#### Batting Order Vulnerability (Slots 1-9)")
+                if order_df is not None and not order_df.empty:
+                    st.dataframe(order_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No Batting Order profiles compiled yet.")
+
             with col2:
                 st.markdown("#### Pitch-Mix Distribution & Frequency")
                 if raw_sc is not None and not raw_sc.empty:
@@ -321,16 +435,18 @@ if not probables.empty:
                         chart_c1, chart_c2 = st.columns(2)
 
                         with chart_c1:
-                            st.bar_chart(pitch_counts, height=220)
+                            # Height reduced from 250 to 180
+                            st.bar_chart(pitch_counts, height=180)
 
                         with chart_c2:
-                            fig, ax = plt.subplots(figsize=(3, 3))
+                            # Figsize reduced from (3,3) to (2.5, 2.5)
+                            fig, ax = plt.subplots(figsize=(2.5, 2.5))
                             colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
                             ax.pie(pitch_counts, labels=pitch_counts.index, autopct='%1.1f%%', startangle=140,
-                                   colors=colors[:len(pitch_counts)], textprops={'fontsize': 7})
+                                   colors=colors[:len(pitch_counts)], textprops={'fontsize': 6})
                             ax.axis('equal')
                             fig.patch.set_facecolor('#0e1117')
-                            plt.title("Arsenal Mix", color="white", fontsize=10)
+                            plt.title("Arsenal Mix", color="white", fontsize=9)
                             for text in ax.texts:
                                 text.set_color('white')
 
@@ -339,5 +455,44 @@ if not probables.empty:
                         st.write("Pitch inventory tracking unavailable.")
                 else:
                     st.warning("Awaiting raw pitch sequence collection mapping.")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                st.markdown("#### Vulnerability Hotspots (Allowed SLG)")
+                if order_df is not None and not order_df.empty:
+                    # Figsize reduced from (5,3.5) to (4, 2.5)
+                    fig_vuln, ax_vuln = plt.subplots(figsize=(4, 2.5))
+                    plot_df = order_df.copy()
+
+                    plot_df['SLG_num'] = plot_df['SLG'].apply(lambda x: float(f"0{x}" if str(x).startswith('.') else x))
+
+                    bars = ax_vuln.bar(plot_df['BATTING ORDER'].str.replace('Slot ', ''), plot_df['SLG_num'],
+                                       color='#ff4b4b', edgecolor='white', width=0.6)
+
+                    fig_vuln.patch.set_facecolor('#0e1117')
+                    ax_vuln.set_facecolor('#0e1117')
+                    ax_vuln.spines['bottom'].set_color('white')
+                    ax_vuln.spines['left'].set_color('white')
+                    ax_vuln.spines['top'].set_visible(False)
+                    ax_vuln.spines['right'].set_visible(False)
+
+                    # Tick and label sizes reduced slightly
+                    ax_vuln.tick_params(colors='white', labelsize=7)
+                    ax_vuln.set_ylabel("Allowed SLG", color='white', fontsize=8)
+                    ax_vuln.set_xlabel("Batting Order Slot", color='white', fontsize=8)
+
+                    for bar in bars:
+                        height = bar.get_height()
+                        # Reduced vertical offset from 3 to 2 for smaller chart height
+                        ax_vuln.annotate(f'.{int(height * 1000):03d}' if height < 1 else f'{height:.3f}',
+                                         xy=(bar.get_x() + bar.get_width() / 2, height),
+                                         xytext=(0, 2),
+                                         textcoords="offset points",
+                                         ha='center', va='bottom', color='white', fontsize=7, weight='bold')
+
+                    st.pyplot(fig_vuln, use_container_width=True)
+                else:
+                    st.info("No Batting Order profiles compiled yet.")
+
 else:
     st.info("Waiting for API data...")
